@@ -1,0 +1,194 @@
+workflow:
+  id: customer-support-workflow
+  name: 智能客服工作流
+  version: 1.0.0
+  type: dag
+  description: 处理客户咨询的智能工作流
+  
+  variables:
+    max_retry_times: 3
+    escalation_threshold: 0.8
+  
+  nodes:
+    # 意图识别节点
+    - id: intent-recognition
+      name: 意图识别
+      type: agent
+      agent: intent-classifier
+      inputs:
+        message: "${trigger.message}"
+        context: "${trigger.context}"
+      outputs:
+        - intent
+        - confidence
+        - entities
+      timeout: 30
+      retry_policy:
+        max_retries: 2
+        retry_delay: 1
+    
+    # 路由决策节点
+    - id: route-decision
+      name: 路由决策
+      type: control
+      subtype: switch
+      dependencies:
+        - intent-recognition
+      condition: "${intent-recognition.intent}"
+      branches:
+        - case: complaint
+          target: complaint-handler
+        - case: inquiry
+          target: inquiry-handler
+        - case: feedback
+          target: feedback-handler
+        - default: general-handler
+    
+    # 投诉处理节点
+    - id: complaint-handler
+      name: 投诉处理
+      type: agent
+      agent: complaint-specialist
+      dependencies:
+        - route-decision
+      inputs:
+        intent_data: "${intent-recognition}"
+        customer_info: "${trigger.customer_info}"
+        history: "${session.history}"
+      outputs:
+        - response
+        - action
+        - priority
+      timeout: 60
+    
+    # 咨询处理节点
+    - id: inquiry-handler
+      name: 咨询处理
+      type: agent
+      agent: inquiry-assistant
+      dependencies:
+        - route-decision
+      inputs:
+        question: "${trigger.message}"
+        entities: "${intent-recognition.entities}"
+      outputs:
+        - answer
+        - confidence
+        - sources
+    
+    # 反馈处理节点
+    - id: feedback-handler
+      name: 反馈处理
+      type: agent
+      agent: feedback-processor
+      dependencies:
+        - route-decision
+      inputs:
+        feedback: "${trigger.message}"
+        sentiment: "${intent-recognition.sentiment}"
+      outputs:
+        - acknowledgment
+        - action_items
+    
+    # 通用处理节点
+    - id: general-handler
+      name: 通用处理
+      type: agent
+      agent: general-assistant
+      dependencies:
+        - route-decision
+      inputs:
+        message: "${trigger.message}"
+      outputs:
+        - response
+    
+    # 质量检查节点
+    - id: quality-check
+      name: 质量检查
+      type: control
+      subtype: parallel
+      dependencies:
+        - complaint-handler
+        - inquiry-handler
+        - feedback-handler
+        - general-handler
+      branches:
+        - sentiment-analysis
+        - compliance-check
+      wait_all: true
+    
+    # 情感分析
+    - id: sentiment-analysis
+      name: 情感分析
+      type: tool
+      tool: sentiment-analyzer
+      dependencies:
+        - quality-check
+      inputs:
+        text: "${previous.response}"
+    
+    # 合规检查
+    - id: compliance-check
+      name: 合规检查
+      type: tool
+      tool: compliance-checker
+      dependencies:
+        - quality-check
+      inputs:
+        content: "${previous.response}"
+        rules: "${config.compliance_rules}"
+    
+    # 响应聚合节点
+    - id: response-aggregator
+      name: 响应聚合
+      type: aggregation
+      dependencies:
+        - sentiment-analysis
+        - compliance-check
+      config:
+        strategy: merge
+      outputs:
+        - final_response
+        - metadata
+    
+    # 发送响应节点
+    - id: send-response
+      name: 发送响应
+      type: tool
+      tool: message-sender
+      dependencies:
+        - response-aggregator
+      inputs:
+        channel: "${trigger.channel}"
+        recipient: "${trigger.user_id}"
+        message: "${response-aggregator.final_response}"
+        metadata: "${response-aggregator.metadata}"
+  
+  # 错误处理器
+  error_handlers:
+    - node_pattern: ".*"
+      error_type: timeout
+      action:
+        type: fallback
+        target: error-recovery
+    
+    - node_pattern: "intent-recognition"
+      error_type: execution_error
+      action:
+        type: retry
+        max_retries: 3
+        backoff: exponential
+  
+  # 触发器配置
+  triggers:
+    - type: webhook
+      config:
+        endpoint: /api/workflow/trigger
+        method: POST
+        auth_required: true
+    
+    - type: event
+      config:
+        topic: customer.message.received
+        filters:
+          channel: ["web", "mobile", "wechat"]

@@ -1,0 +1,231 @@
+workflow:
+  id: order-processing-statemachine
+  name: 订单处理状态机
+  version: 1.0.0
+  type: state_machine
+  description: 订单生命周期管理状态机
+  
+  initial_state: created
+  final_states:
+    - completed
+    - cancelled
+    - refunded
+  
+  states:
+    # 订单创建状态
+    - name: created
+      type: initial
+      on_enter:
+        - type: log
+          params:
+            message: "Order created with ID: ${order_id}"
+            level: info
+        - type: publish_event
+          params:
+            topic: order.created
+            payload:
+              order_id: "${order_id}"
+              amount: "${amount}"
+      transitions:
+        - event: pay
+          target: paid
+          condition: "${amount} > 0"
+          actions:
+            - type: set_variable
+              params:
+                name: payment_time
+                value: "${current_time}"
+        - event: cancel
+          target: cancelled
+          actions:
+            - type: log
+              params:
+                message: "Order cancelled before payment"
+    
+    # 已支付状态
+    - name: paid
+      type: normal
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.paid
+            payload:
+              order_id: "${order_id}"
+              payment_method: "${payment_method}"
+        - type: set_variable
+          params:
+            name: status
+            value: paid
+      transitions:
+        - event: confirm
+          target: confirmed
+          condition: "${inventory_available} == true"
+        - event: out_of_stock
+          target: pending_refund
+          actions:
+            - type: log
+              params:
+                message: "Order out of stock, initiating refund"
+        - event: cancel
+          target: pending_refund
+          condition: "${cancellation_allowed} == true"
+    
+    # 订单确认状态
+    - name: confirmed
+      type: normal
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.confirmed
+            payload:
+              order_id: "${order_id}"
+              estimated_delivery: "${estimated_delivery}"
+      transitions:
+        - event: ship
+          target: shipped
+          actions:
+            - type: set_variable
+              params:
+                name: tracking_number
+                value: "${tracking_number}"
+        - event: cancel
+          target: pending_refund
+          condition: "${can_cancel_after_confirm} == true"
+    
+    # 已发货状态
+    - name: shipped
+      type: normal
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.shipped
+            payload:
+              order_id: "${order_id}"
+              tracking_number: "${tracking_number}"
+              carrier: "${carrier}"
+      transitions:
+        - event: deliver
+          target: delivered
+          actions:
+            - type: set_variable
+              params:
+                name: delivery_time
+                value: "${current_time}"
+        - event: return_initiated
+          target: returning
+          condition: "${days_since_ship} <= 7"
+    
+    # 已送达状态
+    - name: delivered
+      type: normal
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.delivered
+            payload:
+              order_id: "${order_id}"
+              delivery_confirmation: "${delivery_confirmation}"
+      transitions:
+        - event: complete
+          target: completed
+          condition: "${auto_complete_days} >= 7 OR ${customer_confirmed} == true"
+        - event: return_initiated
+          target: returning
+          condition: "${return_window_valid} == true"
+    
+    # 退货中状态
+    - name: returning
+      type: normal
+      on_enter:
+        - type: log
+          params:
+            message: "Return initiated for order: ${order_id}"
+        - type: publish_event
+          params:
+            topic: order.return_initiated
+            payload:
+              order_id: "${order_id}"
+              return_reason: "${return_reason}"
+      transitions:
+        - event: return_received
+          target: pending_refund
+          actions:
+            - type: set_variable
+              params:
+                name: return_received_time
+                value: "${current_time}"
+        - event: return_rejected
+          target: delivered
+          actions:
+            - type: log
+              params:
+                message: "Return rejected: ${rejection_reason}"
+    
+    # 待退款状态
+    - name: pending_refund
+      type: normal
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.pending_refund
+            payload:
+              order_id: "${order_id}"
+              refund_amount: "${refund_amount}"
+      transitions:
+        - event: refund_processed
+          target: refunded
+          actions:
+            - type: set_variable
+              params:
+                name: refund_time
+                value: "${current_time}"
+            - type: publish_event
+              params:
+                topic: payment.refund_processed
+                payload:
+                  order_id: "${order_id}"
+                  amount: "${refund_amount}"
+                  method: "${refund_method}"
+    
+    # 已完成状态（终态）
+    - name: completed
+      type: final
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.completed
+            payload:
+              order_id: "${order_id}"
+              completion_time: "${current_time}"
+        - type: log
+          params:
+            message: "Order ${order_id} completed successfully"
+            level: info
+    
+    # 已取消状态（终态）
+    - name: cancelled
+      type: final
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.cancelled
+            payload:
+              order_id: "${order_id}"
+              cancellation_time: "${current_time}"
+              reason: "${cancellation_reason}"
+    
+    # 已退款状态（终态）
+    - name: refunded
+      type: final
+      on_enter:
+        - type: publish_event
+          params:
+            topic: order.refunded
+            payload:
+              order_id: "${order_id}"
+              refund_time: "${refund_time}"
+              refund_amount: "${refund_amount}"
+        - type: log
+          params:
+            message: "Order ${order_id} refunded: ${refund_amount}"
+            level: info
