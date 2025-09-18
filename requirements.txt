@@ -36,6 +36,7 @@ httpx>=0.25.0
 tenacity>=8.2.0  # Retry library
 jsonschema>=4.19.0
 python-dotenv>=1.0.0
+aiofiles>=23.2.0  # Async file operations
 
 # Development dependencies
 pytest>=7.4.0
