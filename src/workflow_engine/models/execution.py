@@ -224,9 +224,13 @@ class ExecutionEventType(Enum):
     WORKFLOW_SUSPENDED = "workflow_suspended"
     WORKFLOW_RESUMED = "workflow_resumed"
     WORKFLOW_CANCELLED = "workflow_cancelled"
+    WORKFLOW_COMPENSATING = "workflow_compensating"
+    WORKFLOW_COMPENSATED = "workflow_compensated"
     
     NODE_STARTED = "node_started"
     NODE_COMPLETED = "node_completed"
     NODE_FAILED = "node_failed"
     NODE_RETRYING = "node_retrying"
     NODE_SKIPPED = "node_skipped"
+    NODE_COMPENSATING = "node_compensating"
+    NODE_COMPENSATED = "node_compensated"

@@ -22,6 +22,8 @@ from ..storage.repository import WorkflowRepository, ExecutionRepository
 from ..integrations.event_bus import EventBus
 from ..integrations.agent_runtime import AgentRuntime
 from ..integrations.tool_registry import ToolRegistry
+from .error_handler import ErrorHandler, ErrorContext, ErrorStrategy
+from .compensation import CompensationManager, CompensationStrategy
 
 
 logger = logging.getLogger(__name__)
@@ -194,7 +196,9 @@ class WorkflowEngine:
         scheduler: TaskScheduler = None,
         event_bus: EventBus = None,
         agent_runtime: AgentRuntime = None,
-        tool_registry: ToolRegistry = None
+        tool_registry: ToolRegistry = None,
+        error_handler: ErrorHandler = None,
+        compensation_manager: CompensationManager = None
     ):
         self.workflow_repository = workflow_repository or WorkflowRepository()
         self.execution_repository = execution_repository or ExecutionRepository()
@@ -202,6 +206,8 @@ class WorkflowEngine:
         self.event_bus = event_bus or EventBus()
         self.agent_runtime = agent_runtime or AgentRuntime()
         self.tool_registry = tool_registry or ToolRegistry()
+        self.error_handler = error_handler or ErrorHandler()
+        self.compensation_manager = compensation_manager or CompensationManager()
         
         # 注册节点执行器
         self.node_executors: Dict[str, NodeExecutor] = {
@@ -418,24 +424,26 @@ class WorkflowEngine:
         task: ScheduledTask
     ):
         """处理节点错误"""
-        # 检查重试策略
-        retry_policy = node.retry_policy or {}
-        max_retries = retry_policy.get('max_retries', 0)
+        execution = await self._get_execution(task.execution_id)
+        workflow = await self._get_workflow(execution.workflow_id)
         
-        if task.retry_count < max_retries:
-            # 重试
+        # 创建错误上下文
+        error_context = ErrorContext(
+            error=error,
+            node=node,
+            execution=execution,
+            node_execution=node_execution,
+            retry_count=task.retry_count
+        )
+        
+        # 使用错误处理器处理错误
+        strategy = await self.error_handler.handle_error(error_context, workflow)
+        
+        # 根据策略执行相应操作
+        if strategy == ErrorStrategy.RETRY:
+            # 重新调度节点
             task.retry_count += 1
-            node_execution.retry_count = task.retry_count
-            node_execution.status = NodeExecutionStatus.RETRYING
-            
-            # 计算重试延迟
-            retry_delay = retry_policy.get('retry_delay', 1)
-            backoff_factor = retry_policy.get('backoff_factor', 2)
-            delay = retry_delay * (backoff_factor ** (task.retry_count - 1))
-            
-            # 重新调度
-            await asyncio.sleep(delay)
-            await self.scheduler.schedule_node(node, await self._get_execution(task.execution_id))
+            await self.scheduler.schedule_node(node, execution)
             
             # 发布重试事件
             await self._publish_node_event(
@@ -444,10 +452,40 @@ class WorkflowEngine:
                 ExecutionEventType.NODE_RETRYING,
                 {"retry_count": task.retry_count}
             )
-        else:
-            # 重试耗尽
-            node_execution.fail(error)
             
+        elif strategy == ErrorStrategy.COMPENSATE:
+            # 创建并执行补偿计划
+            compensation_context = await self.compensation_manager.create_compensation_plan(
+                workflow,
+                execution,
+                node.id
+            )
+            
+            # 异步执行补偿
+            asyncio.create_task(
+                self._execute_compensation(compensation_context, execution)
+            )
+            
+            # 发布补偿事件
+            await self._publish_execution_event(
+                execution.id,
+                ExecutionEventType.WORKFLOW_COMPENSATING,
+                {"failed_node": node.id}
+            )
+            
+        elif strategy == ErrorStrategy.SKIP:
+            # 发布跳过事件
+            await self._publish_node_event(
+                task.execution_id,
+                node.id,
+                ExecutionEventType.NODE_SKIPPED,
+                {"reason": str(error)}
+            )
+            
+            # 继续执行下游节点
+            await self._trigger_downstream_nodes(task.execution_id, node)
+            
+        else:  # FAIL 或其他
             # 发布失败事件
             await self._publish_node_event(
                 task.execution_id,
@@ -456,8 +494,38 @@ class WorkflowEngine:
                 {"error": str(error)}
             )
             
-            # 根据错误处理策略决定是否继续
-            # TODO: 实现错误处理策略
+            # 更新执行状态
+            await self.execution_repository.update(execution)
+    
+    async def _execute_compensation(self, compensation_context, execution: WorkflowExecution):
+        """执行补偿"""
+        try:
+            # 执行补偿
+            success = await self.compensation_manager.execute_compensation(
+                compensation_context,
+                execution
+            )
+            
+            if success:
+                # 发布补偿完成事件
+                await self._publish_execution_event(
+                    execution.id,
+                    ExecutionEventType.WORKFLOW_COMPENSATED,
+                    {"compensation_status": "success"}
+                )
+            else:
+                # 发布补偿失败事件
+                await self._publish_execution_event(
+                    execution.id,
+                    ExecutionEventType.WORKFLOW_FAILED,
+                    {"compensation_status": "failed"}
+                )
+            
+            # 更新执行状态
+            await self.execution_repository.update(execution)
+            
+        except Exception as e:
+            logger.error(f"Compensation execution failed: {e}", exc_info=True)
     
     async def _prepare_node_input(self, node: Node, context: ExecutionContext) -> Dict[str, Any]:
         """准备节点输入数据"""
